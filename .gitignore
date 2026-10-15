@@ -1,0 +1,14 @@
+# Python
+backend/.venv/
+backend/build/
+backend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# ビルド成果物
+dist/

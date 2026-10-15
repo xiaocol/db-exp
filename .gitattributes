@@ -1,0 +1,2 @@
+# Windows バッチは Shift_JIS・CRLF のまま保持する（改行・文字コードを変換しない）
+*.bat -text
