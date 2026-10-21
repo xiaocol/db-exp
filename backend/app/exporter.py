@@ -1,4 +1,4 @@
-"""Excel（.xlsx）エクスポート処理。
+"""エクスポート処理（Excel / マスク済み INSERT 文 / マスキング用 UPDATE 文）。
 
 - openpyxl の write_only モードでストリーミング出力し、大量件数でもメモリを圧迫しない。
 - 1 シートの上限（1,048,576 行）を超える場合は「表名_2」のように自動でシートを分割する。
@@ -27,7 +27,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.indexed_list import IndexedList
 
-from . import store
+from . import sqlgen, store
 from .config import export_dir, load_settings
 from .db import DbError
 from .masking import RULE_DEFINITIONS, build_masker, display_width
@@ -182,10 +182,17 @@ def safe_sheet_name(name: str, used: set[str]) -> str:
     return candidate
 
 
-def safe_file_name(name: str) -> str:
+FORMAT_EXT = {"xlsx": ".xlsx", "sql_insert": ".sql", "sql_update": ".sql"}
+MEDIA_TYPES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".sql": "application/sql",
+}
+
+
+def safe_file_name(name: str, ext: str = ".xlsx") -> str:
     name = _INVALID_FILE_CHARS.sub("_", name).strip(" .") or "export"
-    if not name.lower().endswith(".xlsx"):
-        name += ".xlsx"
+    if not name.lower().endswith(ext):
+        name += ext
     return name
 
 
@@ -331,7 +338,7 @@ def cleanup_old_files() -> None:
     if retention <= 0:
         return
     limit = time.time() - retention
-    for p in export_dir().glob("*.xlsx*"):
+    for p in export_dir().iterdir():
         try:
             if p.stat().st_mtime < limit:
                 p.unlink()
@@ -345,14 +352,18 @@ def cleanup_old_files() -> None:
 def start_export(req: ExportRequest) -> ExportJob:
     cleanup_old_files()
     now = dt.datetime.now()
+    fmt = req.options.format
+    ext = FORMAT_EXT[fmt]
     default = req.tables[0].table if len(req.tables) == 1 else "export"
-    file_name = safe_file_name(req.file_name or f"{default}_{now:%Y%m%d_%H%M%S}")
+    if fmt == "sql_update":
+        default = f"{default}_マスキング用UPDATE"
+    file_name = safe_file_name(req.file_name or f"{default}_{now:%Y%m%d_%H%M%S}", ext)
     job_id = uuid.uuid4().hex
     job = ExportJob(
         job_id=job_id,
         request=req,
         file_name=file_name,
-        path=export_dir() / f"{job_id}.xlsx",
+        path=export_dir() / f"{job_id}{ext}",
         tables=[TableProgress(schema_name=t.schema_name, table=t.table) for t in req.tables],
     )
     with _jobs_lock:
@@ -366,9 +377,14 @@ def _run_job(job: ExportJob) -> None:
     job.started_at = dt.datetime.now()
     req = job.request
     opts = req.options
-    tmp_path = job.path.with_suffix(".xlsx.part")
+    tmp_path = job.path.with_name(job.path.name + ".part")
     info_rows: list[list[Any]] = []
     try:
+        if opts.format != "xlsx":
+            _run_sql_job(job, tmp_path)
+            tmp_path.replace(job.path)
+            job.status = "done"
+            return
         book = ExcelBook(opts)
         with store.open_session(req.connection_id) as (dialect, conn, profile):
             for spec, progress in zip(req.tables, job.tables):
@@ -486,3 +502,239 @@ def cancel_job(job_id: str) -> ExportJob:
     job = get_job(job_id)
     job.cancel_event.set()
     return job
+
+
+# ---------------------------------------------------------------------------
+# SQL 出力（INSERT 文 / UPDATE 文）
+# ---------------------------------------------------------------------------
+
+INSERT_ROWS_PER_STATEMENT_PG = 100
+
+
+def _target_label(profile: Any) -> str:
+    if profile.db_type == "oracle":
+        target = profile.dsn if profile.oracle_connect_type == "dsn" else f"{profile.host}:{profile.port or 1521}/{profile.database}"
+        return f"Oracle {target}"
+    return f"PostgreSQL {profile.host}:{profile.port or 5432}/{profile.database}"
+
+
+def _table_ref(dialect: Any, spec: TableExportSpec, opts: ExportOptions) -> str:
+    table = dialect.quote_ident(spec.table)
+    if not opts.sql_qualify_schema:
+        return table
+    schema = opts.sql_target_schema.strip() or spec.schema_name
+    return f"{dialect.quote_ident(schema)}.{table}"
+
+
+def _comment(text: str) -> str:
+    return "\n".join("-- " + line if line else "--" for line in text.splitlines())
+
+
+def _plans(dialect: Any, meta: list[ColumnInfo], spec: TableExportSpec, opts: ExportOptions) -> list[sqlgen.ColumnPlan]:
+    by_name = {c.name: c for c in meta}
+    plans = []
+    for col in spec.columns:
+        info = by_name.get(col.name)
+        if info is None:
+            raise DbError(f"列 {col.name} は {spec.schema_name}.{spec.table} に存在しません。")
+        if col.mask is not None and col.mask.type not in ("none", *(r["type"] for r in RULE_DEFINITIONS)):
+            raise DbError(f"不明なマスキング規則です: {col.mask.type}")
+        plans.append(sqlgen.plan_column(sqlgen.classify(dialect.db_type, info), col.mask, opts.hash_salt))
+    return plans
+
+
+def _file_header(job: ExportJob, profile: Any, title: str, extra: list[str]) -> str:
+    lines = [
+        "=" * 70,
+        f"{title}（db-exp で生成）",
+        f"生成日時 : {job.started_at:%Y/%m/%d %H:%M:%S}" if job.started_at else "",
+        f"出力元   : {profile.name}（{_target_label(profile)} / ユーザー {profile.username}）",
+        f"対象表   : {len(job.request.tables)} 表",
+        *extra,
+        "=" * 70,
+    ]
+    return _comment("\n".join(x for x in lines if x is not None))
+
+
+def _session_setup(db_type: str, opts: ExportOptions) -> list[str]:
+    if db_type == "oracle":
+        return [
+            "-- SQL*Plus / SQLcl / SQL Developer 用の設定（& を置換変数として扱わない・空行を許可・エラー時は中止）",
+            "SET DEFINE OFF",
+            "SET SQLBLANKLINES ON",
+            "WHENEVER SQLERROR EXIT ROLLBACK",
+            "",
+        ]
+    encoding = "SJIS" if opts.sql_encoding == "cp932" else "UTF8"
+    return [
+        "-- psql で実行する場合: psql -v ON_ERROR_STOP=1 -f <このファイル>",
+        f"SET client_encoding = '{encoding}';",
+        "SET standard_conforming_strings = on;",
+        "BEGIN;",
+        "",
+    ]
+
+
+def _run_sql_job(job: ExportJob, tmp_path: Path) -> None:
+    req = job.request
+    opts = req.options
+    with store.open_session(req.connection_id) as (dialect, conn, profile):
+        with open(tmp_path, "w", encoding=opts.sql_encoding, errors="replace", newline="\n") as out:
+            if opts.format == "sql_insert":
+                total = _write_inserts(job, out, dialect, conn, profile)
+                job.message = f"{total:,} 件の INSERT 文を出力しました。"
+            else:
+                count = _write_updates(job, out, dialect, conn, profile)
+                job.message = f"{count} 表の UPDATE 文を出力しました。"
+
+
+def _mask_summary(plans: list[sqlgen.ColumnPlan]) -> str:
+    masked = [f"{p.col.name}（{p.rule_label}）" for p in plans if p.rule is not None]
+    return "、".join(masked) if masked else "なし"
+
+
+def _write_inserts(job: ExportJob, out: Any, dialect: Any, conn: Any, profile: Any) -> int:
+    req = job.request
+    opts = req.options
+    ora = dialect.db_type == "oracle"
+    out.write(_file_header(job, profile, "マスク済みデータ（INSERT 文）", [
+        f"COMMIT   : {opts.sql_commit_every:,} 件ごと" if opts.sql_commit_every else "COMMIT   : 最後に 1 回",
+    ]) + "\n\n")
+    setup = _session_setup(dialect.db_type, opts)
+    if ora:
+        # 1 行ごとの「1行が作成されました。」の表示を抑止する（大量件数で遅くなるため）
+        setup.insert(-1, "SET FEEDBACK OFF")
+    out.write("\n".join(setup) + "\n")
+    grand_total = 0
+    warnings: dict[str, int] = {}
+    for spec, progress in zip(req.tables, job.tables):
+        progress.status = "running"
+        meta = dialect.list_columns(conn, spec.schema_name, spec.table)
+        plans = _plans(dialect, meta, spec, opts)
+        if opts.count_rows:
+            with conn.cursor() as cur:
+                cur.execute(dialect.build_count(spec))
+                cnt = int(cur.fetchone()[0])
+            progress.total_rows = min(cnt, spec.max_rows) if spec.max_rows else cnt
+        ref = _table_ref(dialect, spec, opts)
+        cols = ", ".join(dialect.quote_ident(p.col.name) for p in plans)
+        notes = [f"{p.col.name}: {p.note}" for p in plans if p.note]
+        out.write("\n" + _comment("\n".join(x for x in [
+            "-" * 70,
+            f"表       : {spec.schema_name}.{spec.table}",
+            f"マスク   : {_mask_summary(plans)}",
+            f"抽出条件 : {spec.where}" if spec.where else "",
+            f"並び順   : {spec.order_by}" if spec.order_by else "",
+            f"最大件数 : {spec.max_rows:,}" if spec.max_rows else "",
+            *(f"注意     : {n}" for n in notes),
+            "-" * 70,
+        ] if x)) + "\n")
+        if opts.sql_delete_before_insert:
+            out.write(f"DELETE FROM {ref};\n")
+
+        prefix = f"INSERT INTO {ref} ({cols}) VALUES"
+        pending: list[str] = []
+        since_commit = 0
+
+        def flush() -> None:
+            if not pending:
+                return
+            if ora:
+                out.write("".join(f"{prefix} ({v});\n" for v in pending))
+            else:
+                out.write(prefix + "\n  " + ",\n  ".join(f"({v})" for v in pending) + ";\n")
+            pending.clear()
+
+        cur = dialect.open_stream(conn, dialect.build_select(spec))
+        try:
+            while True:
+                rows = cur.fetchmany(FETCH_SIZE)
+                if not rows:
+                    break
+                for row in rows:
+                    values = []
+                    for value, plan in zip(row, plans):
+                        v = sqlgen.apply_plan(plan, value)
+                        try:
+                            values.append(sqlgen.literal(dialect.db_type, plan.col, v))
+                        except sqlgen.LiteralError as exc:
+                            key = f"{spec.table}.{plan.col.name}: {exc}"
+                            warnings[key] = warnings.get(key, 0) + 1
+                            values.append("NULL")
+                    pending.append(", ".join(values))
+                    since_commit += 1
+                    if ora or len(pending) >= INSERT_ROWS_PER_STATEMENT_PG:
+                        flush()
+                    if opts.sql_commit_every and since_commit >= opts.sql_commit_every:
+                        flush()
+                        out.write("COMMIT;\n" if ora else "COMMIT;\nBEGIN;\n")
+                        since_commit = 0
+                progress.rows_written += len(rows)
+                if job.cancel_event.is_set():
+                    raise Cancelled()
+            flush()
+        finally:
+            cur.close()
+        grand_total += progress.rows_written
+        progress.status = "done"
+        out.write(f"-- {spec.schema_name}.{spec.table}: {progress.rows_written:,} 件\n")
+
+    out.write("\nCOMMIT;\n")
+    if warnings:
+        out.write("\n" + _comment("警告:\n" + "\n".join(f"  {k}（{n:,} 件）" for k, n in warnings.items())) + "\n")
+    return grand_total
+
+
+def _write_updates(job: ExportJob, out: Any, dialect: Any, conn: Any, profile: Any) -> int:
+    req = job.request
+    opts = req.options
+    db = dialect.db_type
+    extra = [
+        "",
+        "【重要】本番環境では絶対に実行しないでください。",
+        "        本番データをコピーしたテスト環境で、表の全行をその場でマスクします（元に戻せません）。",
+        "・抽出条件（WHERE）・最大件数は適用されません（全行が対象）。",
+        "・「出力する」のチェックを外した列は UPDATE されません（元の値のまま残ります）。",
+        "・文中の個人情報のマスク（備考欄等）は簡易版です（メール・電話・郵便番号・10桁以上の数字・敬称の前の語のみ）。",
+    ]
+    if opts.hash_salt:
+        extra.append("・ハッシュ化・ダミー氏名のソルトがこのファイルに含まれます。取り扱いに注意してください。")
+    if db == "oracle":
+        extra.append("・ハッシュ化・ダミー氏名には Oracle 12c 以降の STANDARD_HASH を使用します。")
+    out.write(_file_header(job, profile, "マスキング用 UPDATE 文", extra) + "\n\n")
+    out.write("\n".join(_session_setup(db, opts)) + "\n")
+    count = 0
+    for spec, progress in zip(req.tables, job.tables):
+        progress.status = "running"
+        meta = dialect.list_columns(conn, spec.schema_name, spec.table)
+        plans = _plans(dialect, meta, spec, opts)
+        included = {c.name for c in spec.columns}
+        excluded = [c.name for c in meta if c.name not in included]
+        sets = []
+        for plan in plans:
+            quoted = dialect.quote_ident(plan.col.name)
+            expr = sqlgen.update_expr(db, plan, quoted, opts.hash_salt)
+            if expr is not None:
+                sets.append((quoted, expr))
+        notes = [f"{p.col.name}: {p.note}" for p in plans if p.note]
+        if any(p.col.is_pk and p.action != "keep" for p in plans):
+            notes.append("主キーの列を更新します（外部キー制約がある場合はエラーになります）")
+        out.write("\n" + _comment("\n".join(x for x in [
+            "-" * 70,
+            f"表       : {spec.schema_name}.{spec.table}",
+            f"マスク   : {_mask_summary(plans)}",
+            f"対象外の列（更新しない）: {', '.join(excluded)}" if excluded else "",
+            *(f"注意     : {n}" for n in notes),
+            "-" * 70,
+        ] if x)) + "\n")
+        if not sets:
+            out.write("-- マスク対象の列がないため、この表の UPDATE 文はありません。\n")
+        else:
+            body = ",\n       ".join(f"{q} = {e}" for q, e in sets)
+            out.write(sqlgen.wrap_sql(f"UPDATE {_table_ref(dialect, spec, opts)}\n   SET {body};") + "\n")
+            count += 1
+        progress.status = "done"
+        if job.cancel_event.is_set():
+            raise Cancelled()
+    out.write("\nCOMMIT;\n")
+    return count

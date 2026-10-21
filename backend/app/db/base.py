@@ -65,6 +65,13 @@ class Dialect(ABC):
                 pass
             conn.close()
 
+    def recover(self, conn: Any) -> None:
+        """SQL エラー後、同じ接続で処理を続けられる状態に戻す。"""
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
     @abstractmethod
     def server_version(self, conn: Any) -> str: ...
 

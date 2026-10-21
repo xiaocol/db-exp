@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from .. import store
-from ..db import get_dialect
-from ..masking import suggest_rule
+from .. import dbscan, store
+from ..db import DbError, get_dialect
 from ..schemas import (
     ColumnInfo,
     ConnectionInput,
@@ -81,9 +80,16 @@ def list_tables(conn_id: str, schema: str) -> list[TableInfo]:
 
 
 @router.get("/{conn_id}/columns", response_model=list[ColumnInfo])
-def list_columns(conn_id: str, schema: str, table: str) -> list[ColumnInfo]:
+def list_columns(conn_id: str, schema: str, table: str, sample: int = 0) -> list[ColumnInfo]:
+    """列情報と自動判定の結果。sample > 0 なら先頭の値も使って判定する。"""
+    samples: dict = {}
     with store.open_session(conn_id) as (dialect, conn, _):
         columns = dialect.list_columns(conn, schema, table)
-    for col in columns:
-        col.suggested_mask = suggest_rule(col.name, col.comment)
+        if sample > 0:
+            try:
+                samples = dbscan.sample_rows(dialect, conn, schema, table, columns, min(sample, 5000))
+            except DbError:
+                # ビューの定義エラー等で値を取得できなくても、列名だけで判定する
+                dialect.recover(conn)
+    dbscan.analyze_table(schema, table, columns, samples)
     return columns

@@ -78,7 +78,21 @@ class ColumnInfo(BaseModel):
     nullable: bool = True
     is_pk: bool = False
     position: int
+    # 自動判定で「マスキング対象」となった場合の推奨規則（要確認の場合は None）
     suggested_mask: MaskRule | None = None
+    # 自動判定の結果（対象外なら None）
+    suggestion: Suggestion | None = None
+
+
+class Suggestion(BaseModel):
+    """列名・論理名・値の特徴による自動判定の結果。"""
+
+    category: str
+    label: str
+    score: float
+    level: Literal["auto", "review"]
+    rule: MaskRule
+    reasons: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +108,7 @@ class MaskRule(BaseModel):
 
 
 ColumnInfo.model_rebuild()
+Suggestion.model_rebuild()
 
 
 class ColumnSpec(BaseModel):
@@ -116,7 +131,12 @@ class TableExportSpec(BaseModel):
 HeaderMode = Literal["physical", "logical", "both"]
 
 
+ExportFormat = Literal["xlsx", "sql_insert", "sql_update"]
+
+
 class ExportOptions(BaseModel):
+    # 出力形式: xlsx=Excel / sql_insert=マスク済みデータの INSERT 文 / sql_update=テスト環境をマスクする UPDATE 文
+    format: ExportFormat = "xlsx"
     # 見出し: physical=物理名 / logical=論理名(コメント) / both=2行（論理名＋物理名）
     header_mode: HeaderMode = "logical"
     font_name: str = "游ゴシック"
@@ -130,6 +150,16 @@ class ExportOptions(BaseModel):
     # 日付の表示書式
     date_format: str = "yyyy/mm/dd"
     datetime_format: str = "yyyy/mm/dd hh:mm:ss"
+    # ---- SQL 出力（sql_insert / sql_update）----
+    # 出力する SQL の表名に付けるスキーマ名（空欄=元のスキーマ名、sql_qualify_schema=False なら付けない）
+    sql_target_schema: str = ""
+    sql_qualify_schema: bool = True
+    # INSERT 文: 何件ごとに COMMIT するか（0=最後に 1 回）
+    sql_commit_every: int = Field(default=1000, ge=0)
+    # INSERT 文: 先頭に既存データを削除する DELETE 文を付けるか
+    sql_delete_before_insert: bool = False
+    # 文字コード（SQL*Plus を Shift_JIS 環境で使う場合は cp932）
+    sql_encoding: Literal["utf-8", "cp932"] = "utf-8"
 
 
 class ExportRequest(BaseModel):
@@ -173,3 +203,101 @@ class ExportJobStatus(BaseModel):
     tables: list[TableProgress]
     started_at: str | None = None
     finished_at: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 判定結果（マスキング対象一覧・要確認一覧）
+# ---------------------------------------------------------------------------
+
+
+class Finding(BaseModel):
+    """自動判定で見つかったマスキング対象（または要確認）の 1 件。"""
+
+    id: str
+    source: Literal["db", "doc"]
+    # column=列全体 / text=文章中の語句
+    target: Literal["column", "text"]
+    level: Literal["auto", "review"]
+    category: str
+    category_label: str
+    score: float
+    reasons: list[str] = Field(default_factory=list)
+    rule: MaskRule
+    # 場所（DB: file="スキーマ.表"、ドキュメント: file=ファイル名 / location=シート・行など）
+    file: str
+    location: str | None = None
+    column: str | None = None
+    column_comment: str | None = None
+    data_type: str | None = None
+    is_pk: bool = False
+    # 要確認の文中語句（target=text の場合）
+    text: str | None = None
+    occurrences: int = 1
+    # 画面で人が判断するための元の値（ファイル・一覧には出力しない）
+    samples: list[str] = Field(default_factory=list)
+    # マスク後の例（一覧の出力にも使う）
+    masked_samples: list[str] = Field(default_factory=list)
+
+
+class Decision(BaseModel):
+    """人の判断。mask=False なら「マスクしない」。"""
+
+    mask: bool = True
+    rule: MaskRule | None = None
+
+
+class DbScanRequest(BaseModel):
+    schema_name: str
+    # 対象の表（省略時はスキーマ内の全表・ビュー）
+    tables: list[str] | None = None
+    sample_rows: int = Field(default=200, ge=10, le=5000)
+
+
+class ScannedTable(BaseModel):
+    schema_name: str
+    table: str
+    table_type: str = "TABLE"
+    comment: str | None = None
+    columns: list[ColumnInfo] = Field(default_factory=list)
+    sampled_rows: int = 0
+    error: str | None = None
+
+
+class DbScanStatus(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "done", "error", "cancelled"]
+    message: str | None = None
+    schema_name: str
+    total_tables: int = 0
+    done_tables: int = 0
+    current_table: str | None = None
+    tables: list[ScannedTable] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=list)
+
+
+class DocFileInfo(BaseModel):
+    name: str
+    kind: str
+    size: int
+    blocks: int = 0
+    tables: int = 0
+    lines: int = 0
+    error: str | None = None
+
+
+class DocScanResult(BaseModel):
+    scan_id: str
+    files: list[DocFileInfo]
+    findings: list[Finding]
+
+
+class DocExportRequest(BaseModel):
+    decisions: dict[str, Decision] = Field(default_factory=dict)
+    hash_salt: str = ""
+
+
+class ReportRequest(BaseModel):
+    title: str = "マスキング判定結果"
+    source_label: str | None = None
+    findings: list[Finding]
+    decisions: dict[str, Decision] = Field(default_factory=dict)

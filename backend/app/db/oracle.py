@@ -102,6 +102,12 @@ class OracleDialect(Dialect):
             cur.execute("SET TRANSACTION READ ONLY")
         return conn
 
+    def recover(self, conn: Any) -> None:
+        # ロールバックで読み取り専用トランザクションが終わるため、再度設定する
+        super().recover(conn)
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+
     def server_version(self, conn: Any) -> str:
         return f"Oracle {conn.version}"
 

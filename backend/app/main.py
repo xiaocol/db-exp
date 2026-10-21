@@ -17,7 +17,7 @@ from . import __version__
 from .config import load_settings, static_dir
 from .db import DbError
 from .db.oracle import init_thick_mode
-from .routers import connections, export
+from .routers import connections, export, scan
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def create_app() -> FastAPI:
     settings = load_settings()
     init_thick_mode(settings.get("oracle_client_lib_dir"))
 
-    app = FastAPI(title="DBエクスポートツール", version=__version__)
+    app = FastAPI(title="マスキング出力ツール", version=__version__)
     # DNS リバインディング対策: localhost 以外の Host ヘッダーは拒否する
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
 
     app.include_router(connections.router)
     app.include_router(export.router)
+    app.include_router(scan.router)
 
     @app.exception_handler(DbError)
     async def db_error_handler(_: Request, exc: DbError) -> JSONResponse:

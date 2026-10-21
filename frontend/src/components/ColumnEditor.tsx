@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { MaskRuleEditor } from '@/components/MaskRuleEditor'
 import { PreviewDialog } from '@/components/PreviewDialog'
 import { api, errorMessage } from '@/lib/api'
@@ -136,7 +137,7 @@ export function ColumnEditor({
             {table.comment || '（コメントなし）'} ／ 出力 {includedCount} / {columns.length} 列 ／ マスキング {maskedCount} 列
           </p>
         </div>
-        <Button size="sm" variant="outline" onClick={applySuggested} disabled={suggestedCount === 0} title="列名・コメントから個人情報らしき列を判定して設定します">
+        <Button size="sm" variant="outline" onClick={applySuggested} disabled={suggestedCount === 0} title="列名・論理名・先頭の値から個人情報と判定した列に、推奨のマスキングを設定します">
           <ShieldCheckIcon />
           推奨マスキング適用（{suggestedCount}）
         </Button>
@@ -179,10 +180,34 @@ export function ColumnEditor({
                 </td>
                 <td className="px-2 py-2 text-xs">
                   {c.comment || <span className="text-muted-foreground/60">—</span>}
-                  {c.suggested_mask && c.mask.type === 'none' && (
-                    <Badge variant="outline" className="ml-1 h-4 border-orange-300 px-1 text-[10px] text-orange-700">
-                      個人情報の可能性
-                    </Badge>
+                  {c.suggestion && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge
+                          variant="outline"
+                          className={
+                            'ml-1 h-4 cursor-help px-1 text-[10px] ' +
+                            (c.suggestion.level === 'review'
+                              ? 'border-amber-400 bg-amber-50 text-amber-800 dark:bg-amber-950/30'
+                              : c.mask.type === 'none'
+                                ? 'border-orange-400 text-orange-700'
+                                : 'border-orange-200 text-orange-600')
+                          }
+                        >
+                          {c.suggestion.level === 'review' ? `要確認: ${c.suggestion.label}` : c.suggestion.label}
+                        </Badge>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="block">
+                        <p className="font-medium">
+                          {c.suggestion.level === 'review' ? '要確認（人が判断してください）' : '自動判定: マスキング対象'}（確からしさ {Math.round(c.suggestion.score * 100)}%）
+                        </p>
+                        <ul className="mt-1 list-disc pl-4">
+                          {c.suggestion.reasons.map((r, i) => (
+                            <li key={i}>{r}</li>
+                          ))}
+                        </ul>
+                      </TooltipContent>
+                    </Tooltip>
                   )}
                 </td>
                 <td className="px-2 py-2 font-mono text-xs whitespace-nowrap text-muted-foreground">{c.data_type}</td>

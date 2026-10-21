@@ -15,7 +15,7 @@ import datetime as dt
 import hashlib
 import re
 import unicodedata
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable
 
 from .schemas import MaskRule
@@ -189,14 +189,17 @@ def _address(value: Any, params: dict) -> Any:
 
 
 def _date_year(value: Any, params: dict) -> Any:
-    """生年月日など。年のみ残し月日を伏せる → 1985/**/**"""
+    """生年月日など。年のみ残し月日を伏せる → 1985/**/**
+
+    文字列の場合は区切り文字と桁数を保つ（19850401 → 1985****、1985-04-01 → 1985-**-**）。
+    """
     if isinstance(value, (dt.date, dt.datetime)):
         return f"{value.year:04d}/**/**"
-    text = _to_text(value)
-    m = re.match(r"^\s*([0-9０-９]{4})", text)
+    text = _to_text(value).strip()
+    m = re.match(r"^([0-9０-９]{4})", text)
     if m:
-        year = unicodedata.normalize("NFKC", m.group(1))
-        return f"{year}/**/**"
+        rest = "".join(mask_char(c) if c.isdigit() else c for c in text[4:])
+        return m.group(1) + rest
     # 和暦（昭和60年1月1日 など）は元号＋年まで残す
     m = re.match(r"^\s*((?:明治|大正|昭和|平成|令和|[MTSHR])\s*[0-9０-９元]{1,2}\s*年?)", text)
     if m:
@@ -251,16 +254,46 @@ def _null(value: Any, params: dict) -> Any:
 
 
 def _round_number(value: Any, params: dict) -> Any:
-    """数値の丸め（金額・年収などの概数化）。digits=-3 なら千の位で丸める。"""
+    """数値の丸め（金額・年収などの概数化）。digits=-3 なら千の位で四捨五入する。"""
     digits = int(params.get("digits", -3) or 0)
     try:
-        num = Decimal(_to_text(value))
+        num = Decimal(_to_text(value).replace(",", ""))
+        if not num.is_finite():
+            raise ValueError
     except Exception:  # noqa: BLE001 - 数値に変換できない値は全マスク
         return mask_all(_to_text(value))
-    rounded = round(num, digits)
+    # SQL の ROUND と結果をそろえるため、銀行丸めではなく四捨五入にする
+    rounded = num.quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
     if digits <= 0:
         return int(rounded)
     return float(rounded)
+
+
+def mask_text_pii(text: str, include_review: bool = True, salt: str = "") -> str:
+    """文章中で検出した個人情報のみを、カテゴリごとの既定規則でマスクする。"""
+    from .categories import CATEGORY_BY_CODE
+    from .textscan import find_pii
+
+    matches = find_pii(text)
+    if not include_review:
+        matches = [m for m in matches if m.level == "auto"]
+    out, pos = [], 0
+    for m in matches:
+        cat = CATEGORY_BY_CODE[m.category]
+        masker = build_masker(MaskRule(type=cat.rule, params=dict(cat.params)), salt)
+        fragment = text[m.start : m.end]
+        masked = masker(fragment) if masker else fragment
+        out.append(text[pos : m.start])
+        out.append(mask_all(fragment) if masked is None or not isinstance(masked, str) else masked)
+        pos = m.end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _text_pii(value: Any, params: dict, salt: str = "") -> Any:
+    """自由記述欄。文中の氏名・電話番号・メールアドレス等のみを伏せる。"""
+    include_review = params.get("include_review", True) not in (False, "false", 0, "0")
+    return mask_text_pii(_to_text(value), include_review, salt)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +383,23 @@ RULE_DEFINITIONS: list[dict[str, Any]] = [
         "params": [{"key": "length", "label": "桁数", "kind": "number", "default": 16}],
     },
     {
+        "type": "text_pii",
+        "label": "文中の個人情報のみマスク（備考欄等）",
+        "example": "山田様 TEL 03-1234-5678 → 山＊様 TEL **-****-5678",
+        "params": [
+            {
+                "key": "include_review",
+                "label": "対象",
+                "kind": "select",
+                "default": "true",
+                "options": [
+                    {"value": "true", "label": "可能性があるものも含める"},
+                    {"value": "false", "label": "確度の高いものだけ"},
+                ],
+            }
+        ],
+    },
+    {
         "type": "fixed",
         "label": "固定値に置換",
         "example": "任意の値 → ＊＊＊",
@@ -375,6 +425,7 @@ _SIMPLE_RULES: dict[str, Callable[[Any, dict], Any]] = {
 _SALTED_RULES: dict[str, Callable[[Any, dict, str], Any]] = {
     "hash": _hash,
     "fake_name": _fake_name,
+    "text_pii": _text_pii,
 }
 
 VALID_RULE_TYPES = {"none", *_SIMPLE_RULES, *_SALTED_RULES}
@@ -409,33 +460,14 @@ def build_masker(rule: MaskRule | None, salt: str = "") -> MaskFunc | None:
 # 列名・コメントからのマスキング規則の自動推定
 # ---------------------------------------------------------------------------
 
-# (パターン, 規則, パラメータ)。上から順に評価し、最初に一致したものを採用する。
-# 日本の業務システムで多いローマ字列名（SHIMEI, JUSHO 等）も考慮している。
-_SUGGEST_PATTERNS: list[tuple[re.Pattern[str], str, dict[str, Any]]] = [
-    (re.compile(r"パスワード|暗証|PASSWORD|PASSWD|(^|_)PWD($|_)", re.I), "null", {}),
-    (re.compile(r"マイナンバー|個人番号|MY_?NUMBER|KOJIN_?BANGO", re.I), "full", {}),
-    (re.compile(r"メール|E?_?MAIL", re.I), "email", {}),
-    (re.compile(r"郵便|〒|(^|_)ZIP|POST(AL)?_?(CODE|NO)|YUBIN", re.I), "postal", {}),
-    (re.compile(r"住所|所在地|ADDR|JUSHO|JYUSHO", re.I), "address", {}),
-    (re.compile(r"電話|携帯|TEL|PHONE|FAX|MOBILE|DENWA", re.I), "digits", {"keep_tail": 4}),
-    (re.compile(r"カード|口座|CARD_?(NO|NUM)|CREDIT|ACCOUNT_?(NO|NUM)|KOUZA|KOZA", re.I), "digits", {"keep_tail": 4}),
-    (re.compile(r"生年月日|誕生日|BIRTH|SEINENGAPPI|TANJOBI", re.I), "date_year", {}),
-    (
-        re.compile(
-            r"氏名|名前|姓名|フリガナ|ふりがな|カナ氏名|(顧客|会員|社員|従業員|担当者|契約者|患者|利用者|申込者)名"
-            r"|SHIMEI|SEIMEI|FULL_?NAME|FIRST_?NAME|LAST_?NAME|(^|_)(SEI|MEI)(_KANA|_KANJI)?$|NAME_?(KANA|KANJI)|KANA_?NAME",
-            re.I,
-        ),
-        "name",
-        {},
-    ),
-]
 
+def suggest_rule(column_name: str, comment: str | None, data_type: str = "") -> MaskRule | None:
+    """列名・コメント（論理名）だけから、自動でマスクすべき列の規則を推定する。
 
-def suggest_rule(column_name: str, comment: str | None) -> MaskRule | None:
-    """列名・コメント（論理名）から適切なマスキング規則を推定する。"""
-    targets = [t for t in (comment, column_name) if t]
-    for pattern, rule_type, params in _SUGGEST_PATTERNS:
-        if any(pattern.search(t) for t in targets):
-            return MaskRule(type=rule_type, params=dict(params))
-    return None
+    値を見ない簡易判定のため、確度の高いもの（自動判定）のみを返す。
+    サンプル値も使った判定は detector.analyze_column を使用する。
+    """
+    from .detector import analyze_column
+
+    verdict = analyze_column(column_name, comment, data_type)
+    return verdict.rule if verdict.level == "auto" else None

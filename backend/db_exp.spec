@@ -22,6 +22,8 @@ hiddenimports = []
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("oracledb")
 hiddenimports += collect_submodules("app")
+# ファイルのアップロード（multipart/form-data）の解析に使用
+hiddenimports += collect_submodules("python_multipart")
 # cryptography は oracledb の Thin モードが内部（C拡張）から遅延 import するため、
 # 自動解析では検出されない。明示しないと exe で DPY-3016 エラーになる。
 for pkg in ("psycopg", "psycopg_binary", "cryptography"):

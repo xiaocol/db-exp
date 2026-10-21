@@ -18,7 +18,6 @@ from ..schemas import (
 
 router = APIRouter(prefix="/api", tags=["エクスポート"])
 
-XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @router.get("/masking/rules")
@@ -77,4 +76,5 @@ def export_download(job_id: str) -> FileResponse:
     if job.status != "done" or not job.path.exists():
         raise DbError("ダウンロードできるファイルがありません（未完了または保持期間切れ）。")
     # 日本語ファイル名は RFC 5987（filename*=UTF-8''...）形式で送られる
-    return FileResponse(job.path, media_type=XLSX_MEDIA_TYPE, filename=job.file_name)
+    media_type = exporter.MEDIA_TYPES.get(job.path.suffix, "application/octet-stream")
+    return FileResponse(job.path, media_type=media_type, filename=job.file_name)

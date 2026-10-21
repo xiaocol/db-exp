@@ -47,7 +47,7 @@ def main() -> None:
     from app.config import data_dir, load_settings
     from app.main import app
 
-    parser = argparse.ArgumentParser(description="DBエクスポートツール")
+    parser = argparse.ArgumentParser(description="db-exp マスキング出力ツール")
     parser.add_argument("--port", type=int, default=None, help="待ち受けポート（既定: 8765）")
     parser.add_argument("--no-browser", action="store_true", help="起動時にブラウザを開かない")
     args = parser.parse_args()
@@ -58,7 +58,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     print("=" * 60)
-    print(" DBエクスポートツール")
+    print(" db-exp マスキング出力ツール")
     print(f"   画面URL   : {url}")
     print(f"   データ保存: {data_dir()}")
     print("   終了するにはこのウィンドウを閉じるか Ctrl+C を押してください。")

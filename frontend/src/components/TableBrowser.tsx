@@ -1,7 +1,8 @@
 // スキーマ選択と表・ビューの一覧（名前・コメントで検索可能）
 import { useMemo, useState } from 'react'
-import { Loader2Icon, SearchIcon, TableIcon, EyeIcon } from 'lucide-react'
+import { Loader2Icon, ScanSearchIcon, SearchIcon, TableIcon, EyeIcon } from 'lucide-react'
 
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -16,9 +17,12 @@ interface Props {
   loading: boolean
   selected: string | null
   onSelect: (table: TableInfo) => void
+  /** 表示中（検索で絞り込んだ）の表をまとめてスキャンする */
+  onScan: (tables: TableInfo[]) => void
+  scanning: boolean
 }
 
-export function TableBrowser({ schemas, schema, onSchemaChange, tables, loading, selected, onSelect }: Props) {
+export function TableBrowser({ schemas, schema, onSchemaChange, tables, loading, selected, onSelect, onScan, scanning }: Props) {
   const [keyword, setKeyword] = useState('')
 
   const filtered = useMemo(() => {
@@ -56,8 +60,18 @@ export function TableBrowser({ schemas, schema, onSchemaChange, tables, loading,
           onChange={(e) => setKeyword(e.target.value)}
         />
       </div>
-      <div className="text-xs text-muted-foreground">
-        {loading ? '読み込み中…' : `${filtered.length} / ${tables.length} 件`}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">{loading ? '読み込み中…' : `${filtered.length} / ${tables.length} 件`}</span>
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={loading || scanning || filtered.length === 0}
+          onClick={() => onScan(filtered)}
+          title="表示中の表の列名・論理名・先頭の値から、マスキングが必要な列をまとめて判定します"
+        >
+          {scanning ? <Loader2Icon className="animate-spin" /> : <ScanSearchIcon />}
+          一括スキャン（{filtered.length}表）
+        </Button>
       </div>
       <ScrollArea className="min-h-0 flex-1 rounded-md border">
         {loading ? (

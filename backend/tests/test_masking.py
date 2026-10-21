@@ -87,7 +87,10 @@ def test_address(src, expected):
 def test_date_year():
     assert m("date_year", dt.date(1985, 4, 1)) == "1985/**/**"
     assert m("date_year", dt.datetime(1985, 4, 1, 10, 0)) == "1985/**/**"
-    assert m("date_year", "１９８５年４月１日") == "1985/**/**"
+    # 文字列は区切り・桁数を保つ（列の長さを超えないようにするため）
+    assert m("date_year", "１９８５年４月１日") == "１９８５年＊月＊日"
+    assert m("date_year", "19850401") == "1985****"
+    assert m("date_year", "1985-04-01") == "1985-**-**"
     assert m("date_year", "昭和60年4月1日") == "昭和60年＊＊月＊＊日"
 
 
